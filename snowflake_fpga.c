@@ -2,7 +2,7 @@
 /// 640x480 version!
 /// change to fixed point 
 /// compile with:
-/// gcc snow.c -o snow -pthread
+/// gcc fpga_draw.c -o draw -pthread
 ///////////////////////////////////////
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,13 +14,16 @@
 #include <sys/shm.h> 
 #include <sys/mman.h>
 #include <sys/time.h> 
+#include "address_map_arm_brl4.h"
 #include <pthread.h>
 
+// lock for scanf
+pthread_mutex_t scan_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Cyclone V FPGA devices */
 #define HW_REGS_BASE          0xff200000
 //#define HW_REGS_SPAN        0x00200000 
-#define HW_REGS_SPAN          0x00005000 
+#define HW_REGS_SPAN          0x00005000                                      
 
 #define FPGA_ONCHIP_BASE      0xC8000000
 //#define FPGA_ONCHIP_END       0xC803FFFF
@@ -32,84 +35,29 @@
 #define FPGA_CHAR_END         0xC9001FFF
 #define FPGA_CHAR_SPAN        0x00002000
 
-//// BASE ADDRESSES FOR PIO ADDRESSES ////
-#define PIO_ALPHA_BASE      0x100
-#define PIO_BETA_BASE       0x110
-#define PIO_GAMMA_BASE      0x120
-#define PIO_RESET_FROM_BASE 0x130
-#define PIO_IS_FROZEN_BASE  0x140
-#define PIO_FROZEN_Y_BASE   0x150
-#define PIO_RESET_TO_BASE   0x160
-#define PIO_DONE_SEND_BASE  0x170
-
-// =============================== FPGA ============================
-volatile unsigned int *pio_alpha_addr       = NULL;
-volatile unsigned int *pio_beta_addr        = NULL;
-volatile unsigned int *pio_gamma_addr       = NULL;
-volatile unsigned int *pio_reset_addr       = NULL;
-volatile unsigned int *pio_is_frozen_addr       = NULL;
-// volatile unsigned int *pio_frozen_x_addr    = NULL;
-volatile unsigned int *pio_frozen_y_addr    = NULL;
-volatile unsigned int *pio_reset_to_addr    = NULL;
-volatile unsigned int *pio_done_send_addr   = NULL;
-
-
-// fix18 frozen_x;
-// fix18 frozen_y;
-
-// Variables to store outputs from the FPGA
-typedef struct {
-    // fix18 frozen_x;
-    int is_frozen;
-    int frozen_y;
-} yCoordinate;
-
-#define BUFFER_SIZE 11
-yCoordinate buffer[BUFFER_SIZE];
-int buffer_index = 0;
-
-// BUFFER LOCK VARIABLES
-pthread_mutex_t buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t buffer_not_empty = PTHREAD_COND_INITIALIZER;
-pthread_cond_t buffer_not_full = PTHREAD_COND_INITIALIZER;
-pthread_cond_t one_iteration = PTHREAD_COND_INITIALIZER;
-
 /* function prototypes */
 void VGA_text (int, int, char *);
 void VGA_text_clear();
 void VGA_box (int, int, int, int, short);
+void VGA_line(int, int, int, int, short) ;
+void VGA_disc (int, int, int, short);
 void VGA_cell (int, int, int, int, short);
-void VGA_rect (int, int, int, int, short);
+// fixed pt
+typedef signed int fix28 ;
+//multiply two fixed 4:28
+#define multfix28(a,b) ((fix28)(((( signed long long)(a))*(( signed long long)(b)))>>28)) 
+#define float2fix28(a) ((fix28)((a)*268435456.0f)) // 2^28
+#define fix2float28(a) ((float)(a)/268435456.0f) 
+#define int2fix28(a) ((a)<<28);
+// the fixed point value 4
+#define FOURfix28 0x40000000 
+#define SIXTEENTHfix28 0x01000000
+#define ONEfix28 0x10000000
 
-// MACROS FOR FIXED POINT CONVERSION // 
-typedef signed int fix18 ;
-#define mult2fix18(a,b) ((fix18)(((( signed long long)(a))*(( signed long long)(b)))>>18)) 
-#define float2fix18(a) ((fix18)((a)*262144.0f)) // 2^18
-#define fix2float18(a) ((float)(a)/262144.0f) 
-#define int2fix28(a) ((a)<<18);
+// measure time
+struct timeval t1, t2;
+double elapsed_time;
 
-// pixel macro
-#define VGA_PIXEL(x,y,color) do{\
-    char  *pixel_ptr ;\
-    pixel_ptr = (char *)vga_pixel_ptr + ((y)<<10) + (x) ;\
-    *(char *)pixel_ptr = (color);\
-} while(0)
-
-// 16-bit primary colors
-#define red  (0+(0<<5)+(31<<11))
-#define dark_red (0+(0<<5)+(15<<11))
-#define green (0+(63<<5)+(0<<11))
-#define dark_green (0+(31<<5)+(0<<11))
-#define blue (31+(0<<5)+(0<<11))
-#define dark_blue (15+(0<<5)+(0<<11))
-#define yellow (0+(63<<5)+(31<<11))
-#define cyan (31+(63<<5)+(0<<11))
-#define magenta (31+(0<<5)+(31<<11))
-#define black (0x0000)
-#define gray (15+(31<<5)+(51<<11))
-#define white (0xffff)
-int colors[] = {red, dark_red, green, dark_green, blue, dark_blue, 
-        yellow, cyan, magenta, gray, black, white};
 
 // the light weight buss base
 void *h2p_lw_virtual_base;
@@ -122,6 +70,10 @@ void *vga_pixel_virtual_base;
 volatile unsigned int * vga_char_ptr = NULL ;
 void *vga_char_virtual_base;
 
+// RAM FPGA command buffer
+volatile unsigned int * sram_ptr = NULL ;
+void *sram_virtual_base;
+
 // /dev/mem file id
 int fd;
 
@@ -133,580 +85,641 @@ int shared_time;
 int shared_note;
 char shared_str[64];
 
-// BUFFER INIT
-
-// char frozen_x_buffer[64];
-char is_frozen_buffer[64];
-char frozen_y_buffer[64];
-
 // loop identifiers
 int i,j,k,x,y;
+
+
+// ----- PIO ADDRESS BASES ----- //
+#define PIO_RESET_TO_HPS_BASE       0x00000000 
+
+volatile unsigned int *pio_reset_to_hps = NULL;
+
+///////////////////////////////////////////////// 
+#define WIDTH 639
+#define HEIGHT 479 
+
+#define red  (0+(0<<5)+(31<<11))
+#define dark_red (0+(0<<5)+(15<<11))
+#define green (0+(63<<5)+(0<<11))
+#define dark_green (0+(31<<5)+(0<<11))
+#define blue (31+(0<<5)+(0<<11))
+#define dark_blue (15+(0<<5)+(0<<11))
+#define yellow (0+(63<<5)+(31<<11))
+#define cyan (31+(63<<5)+(0<<11))
+#define magenta (31+(0<<5)+(31<<11))
+#define black (0x0000)
+#define gray (15+(31<<5)+(51<<11))
+#define white (0xffff)
+
+#define NUM_NEIGHBORS 6
+
+typedef struct {
+    float u;   // water used in diffusion
+    float v;   // water not used in diffusion
+    float s;   // total water
+	float next_u; // water used next step 
+	float next_v; // water not used next step 
+    bool is_receptive;
+} Cell;
+
+Cell cells[WIDTH][HEIGHT];
+float s_vals[WIDTH][HEIGHT]; // Array to store s values for visualization or debugging
+Cell* neighbors[NUM_NEIGHBORS];
+Cell frozen[WIDTH][HEIGHT];
+int num_neighbors;
+float u_avg = 0.0;
+float sum_u = 0.0;
+short color = 0xffff; 
+// 8-bit color
+#define rgb(r,g,b) ((((r)&7)<<5) | (((g)&7)<<2) | (((b)&3)))
+
+// pixel macro
+#define VGA_PIXEL(x,y,color) do{\
+	char  *pixel_ptr ;\
+	pixel_ptr = (char *)vga_pixel_ptr + ((y)<<10) + (x) ;\
+	*(char *)pixel_ptr = (color);\
+} while(0)
+
+float init_alpha = 1.0;
+float init_beta = 0.8;
+float old_beta;
+float init_gamma = 0.01;
+int set; 
+int init_reset;
+int reset_beta = 0;
+int paused = 0; 
+// char pick_color[10];
+
+// Get neighbors for a specific coordinate
+int get_num_neighbors(Cell* neighbors[], int x, int y) {
+    int count = 0;
+
+	if (y != 0) { // top neighbor, does not rely on if the column is even or odd
+		neighbors[count++] = &cells[x][y-1];
+	}
+	if (y != HEIGHT-1) { // bottom  neighbor, does not rely on if the column is even or odd
+		neighbors[count++] = &cells[x][y+1];
+	}
+	
+	if (x % 2 == 0) { // even columns
+		if (x != 0) { // left side neighbors, the 0th column does not have left side neighbors
+			neighbors[count++] = &cells[x-1][y];
+			if (y != 0) { // only top left if y not 0
+				neighbors[count++] = &cells[x-1][y-1];
+			}
+		}
+		if (x != WIDTH-1) { // right side neighbors
+			neighbors[count++] = &cells[x+1][y];
+			if (y != 0) { // only top right if y not 0
+				neighbors[count++] = &cells[x+1][y-1];
+			}
+		}
+		
+	}
+	if (x % 2 == 1){ // odd columns
+		// odd numbered columns always have left side neighbors
+		neighbors[count++] = &cells[x-1][y];
+		if (y != HEIGHT-1) { // only bottom left if y not at bottom
+			neighbors[count++] = &cells[x-1][y+1];
+		}
+
+		if (x != WIDTH-1) { // right side neighbors
+			neighbors[count++] = &cells[x+1][y];
+			if (y != HEIGHT-1) { // only bottom right if y not height-1
+				neighbors[count++] = &cells[x+1][y+1];
+			}
+		}
+	}
+
+    return count;
+}
+
+void initialize_remaining_grid(){
+	for ( i = 0; i < WIDTH; i++) {
+        for ( j = 0; j < HEIGHT; j++) {
+			if (cells[i][j].u == old_beta){
+				cells[i][j].u = init_beta;
+			}
+        }
+    }
+}
+
+void initialize_grid() {
+    for ( i = 0; i < WIDTH; i++) {
+        for ( j = 0; j < HEIGHT; j++) {
+            cells[i][j].s = init_beta;
+            cells[i][j].is_receptive = false;
+            cells[i][j].u = 0;
+			cells[i][j].next_u = 0;
+			cells[i][j].next_v = 0;
+            cells[i][j].v = 0;
+        }
+    }
+    // Set the center cell
+    cells[ (WIDTH - 1 ) / 4 ] [ (HEIGHT - 1 ) / 4].s = 1.0;
+    cells[ (WIDTH - 1 ) / 4 ] [ (HEIGHT - 1 ) / 4].is_receptive = true;
+
+	cells[ (WIDTH - 1 ) / 4 ] [ 3 * (HEIGHT - 1 ) / 16].s = 1.0;
+    cells[ (WIDTH - 1 ) / 4 ] [ 3 * (HEIGHT - 1 ) / 16].is_receptive = true;
+
+	cells[ 6 * (WIDTH - 1 ) / 16 ] [ (HEIGHT - 1 ) / 8].s = 1.0;
+    cells[ 6 * (WIDTH - 1 ) / 16 ] [ (HEIGHT - 1 ) / 8].is_receptive = true;
+
+
+	cells[ 6 * (WIDTH - 1 ) / 16 ] [ 6 * (HEIGHT - 1 ) / 16].s = 1.0;
+    cells[ 6 * (WIDTH - 1 ) / 16 ] [ 6 * (HEIGHT - 1 ) / 16].is_receptive = true;
+
+	cells[ (WIDTH - 1 ) / 4 ] [ 5 * (HEIGHT - 1 ) / 16].s = 1.0;
+    cells[ (WIDTH - 1 ) / 4 ] [ 5 * (HEIGHT - 1 ) / 16].is_receptive = true;
+
+	cells[ 6 * (WIDTH - 1 ) / 16] [ 6 * (HEIGHT - 1 ) / 16].s = 1.0;
+    cells[ 6 * (WIDTH - 1 ) / 16] [ 6 * (HEIGHT - 1 ) / 16].is_receptive = true;
+
+	cells[  (WIDTH - 1 ) / 8] [ 6 * (HEIGHT - 1 ) / 16].s = 1.0;
+    cells[  (WIDTH - 1 ) / 8] [ 6 * (HEIGHT - 1 ) / 16].is_receptive = true;
+
+	cells[ (WIDTH - 1 ) / 6 ] [ (HEIGHT - 1 ) / 6].s = 1.0;
+    cells[ (WIDTH - 1 ) / 6 ] [ (HEIGHT - 1 ) / 6].is_receptive = true;
+
+}
 
 ///////////////////////////////////////////////////////////////
 // THREADS ////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////
 
-// INITAL VARIABLES TO SEND TO FGPA 
-float temp_alpha = 1.0;
-float temp_beta = 0.8;
-float temp_gamma = 0.01;
-
-// change reset value via trigger 
-int init_reset = 0; 
-int set = 0;
-short color;
-
-/// MUTE
-
-///////////////////////////////////////////////////////////////
-// for debug  // 
-///////////////////////////////////////////////////////////////
-#include <stdio.h>
-
-void print_buffer() {
-    // pthread_mutex_lock(&buffer_mutex);  // Lock the buffer for safe access
-
-    printf("buffer content:\n");
-    for ( i = 0; i < buffer_index; ++i) {  // Only iterate up to the current buffer index
-        printf("idx %d: is_frozen = %d, frozen_y = %d\n", i, buffer[i].is_frozen, buffer[i].frozen_y);
-    }
-
-    // pthread_mutex_unlock(&buffer_mutex);  // Unlock the buffer after done reading
-}
-
-void * debug_thread() {
-    while (1) {
-        print_buffer();
-        sleep(1);  // Print the buffer contents every second
-    }
-}
-
 ///////////////////////////////////////////////////////////////
 // reset thread  // 
 ///////////////////////////////////////////////////////////////
 
+void * reset_thread() {
 
-void clear_buffer() {
-    for ( i = 0; i < 11; i++) {  
-        buffer[i].frozen_y = 0;
-        buffer[i].is_frozen = 0;
+	while (1) {
+		if(*pio_reset_to_hps)
+		{ 
+			// VGA_box (0, 0, 639, 479, 0x0000);
+			init_reset = 1;
+			init_alpha = 1.0;
+			init_beta = 0.8;
+			init_gamma = 0.01;
+		}
+
+	}
+
+}
+
+///////////////////////////////////////////////////////////////
+// modify paramters through scan thread // 
+///////////////////////////////////////////////////////////////
+
+void * scan_thread () {
+	int xcoord;
+	int ycoord;
+
+	while (1) { 
+		// which category to change
+
+		printf("0: alpha, 1: beta, 2: gamma, 3: new seed, 4: pause, 5: color, 6: print time, 7: clear -- ");
+    	scanf("%i", &set);
+
+		switch ( set ) {
+		
+			case 0:  // changing alpha 
+
+				printf("Enter alpha: ");
+				scanf("%f", &init_alpha);
+			
+			break;
+
+			case 1:  // changing beta 
+
+				printf("Enter beta: ");
+				scanf("%f", &init_beta);
+				
+			break; 
+
+			case 2:  // changing gamma 
+
+				printf("Enter gamma: ");
+				scanf("%f", &init_gamma);
+
+			break; 
+
+			case 3: 
+				printf("Enter x coordinate (0-639): ");
+				scanf("%d", &xcoord);
+				printf("Enter y coordinate (0-479): ");
+				scanf("%d", &ycoord);
+
+				cells[xcoord / 2] [ycoord / 2].s = 1.0;
+				cells[xcoord / 2] [ycoord / 2].is_receptive = true;	
+
+			break;
+
+			case 4:  // setting paused 
+
+				printf("Pause/Play: ");
+				scanf("%i", &paused);
+			break;
+
+			case 5:  // setting color 
+
+				printf("Choose Color: ");
+				scanf("%x", &color);
+
+			break;
+
+			case 6:
+				// printf("Print time: ");
+				printf("\ntime per iteration: %.2f ms \n", elapsed_time);
+
+
+			break;
+			
+
+			case 7: // clear screen 
+				init_reset = 1;
+				init_alpha = 1.0;
+				init_beta = 0.8;
+				init_gamma = 0.01;
+
+			break;
+
+		} 
+
+	} 
+
+} 
+
+void one_iter() {
+
+    // step 1: determine receptive sites
+    for ( i = 0; i < WIDTH; i++) {
+        for ( j = 0; j < HEIGHT; j++) {
+
+            if (cells[i][j].is_receptive) {
+                cells[i][j].u = 0;
+                cells[i][j].v = cells[i][j].s;
+                cells[i][j].next_v = cells[i][j].s + init_gamma;
+            } 
+			else {
+                cells[i][j].u = cells[i][j].s;
+                cells[i][j].v = 0;
+            }
+        }
     }
-    buffer_index = 0;
+
+    // step 2: modify cell values == doing actual diffusion
+	for (i = 0; i < WIDTH; i++) {
+		for (j = 0; j < HEIGHT; j++) {
+
+			if (i == 0 || i == WIDTH-1 || j == 0 || j == HEIGHT-1) { // for edge cells
+				cells[i][j].u = init_beta;
+				cells[i][j].v = 0;
+			}
+
+			else { // everything else
+				num_neighbors = get_num_neighbors(neighbors, i, j); // get num neighbors @ specific coord + modify neighbors
+
+				sum_u = 0;
+
+				for (k = 0; k < num_neighbors; k++) {
+					sum_u += neighbors[k]->u; // Sum u values of all neighbors
+				}
+
+				u_avg = sum_u / num_neighbors; // Calculate average u
+				
+				cells[i][j].next_u = cells[i][j].u + (init_alpha / 2 * (u_avg - cells[i][j].u)); // update u based on diffusion eq 
+				cells[i][j].s = cells[i][j].next_u + cells[i][j].next_v; 
+
+				// Update receptiveness based on the new sp
+				if (cells[i][j].s >= 1) {
+					cells[i][j].is_receptive = true;
+				}
+
+			}
+
+		}
+	}
+
+	// step 3: all s values must be updated to determine new boundary 
+	for (i = 0; i < WIDTH; i++) { 
+		for (j = 0; j < HEIGHT; j++) { 
+			if (!cells[i][j].is_receptive) {
+				num_neighbors = get_num_neighbors(neighbors, i, j); 
+
+				for (k = 0; k < num_neighbors; k++) {
+					if (neighbors[k]->s >= 1) { 
+
+						cells[i][j].is_receptive = true; // one of the neighbors is frozen, so we mark this cell as receptive
+					} 
+				}
+
+			}
+
+		}
+	}
+
+ }
+
+///////////////////////////////////////////////////////////////
+// draw thread // 
+///////////////////////////////////////////////////////////////
+
+void * draw_thread () {
+	int iters = 0;
+	initialize_grid();
+	while(1){
+		// if (iters >= 200){
+		// 	// stop
+		// 	return 1;
+		// }
+		
+		
+		if (init_reset) { 
+			init_reset = 0;
+			VGA_box (0, 0, 639, 479, 0x0000);
+			initialize_grid();
+			iters = 0;
+		}
+
+		if (reset_beta){
+			reset_beta = 0;
+			initialize_remaining_grid();
+		}
+
+		if (paused == 0){
+			gettimeofday(&t1, NULL);
+
+			one_iter(); // does the actual calculation 
+			for (i = 0; i < WIDTH; i++) {
+				for (j = 0; j < HEIGHT; j++) {
+					int count = 0;
+
+					if (i % 2 == 0) { // even columns 
+						if (cells[i][j].s >= 1) { 
+							
+							// top left
+							// if (i < ((WIDTH-1) / 2) && j < ((HEIGHT-1)/2)){
+								for (x = 0; x < 2; x++) {
+									for (y = 0; y < 2; y++) {
+
+										int cellx = (2*i)+x;
+										int celly = (2*j)+y;
+										VGA_disc(cellx, celly, 0, color);
+
+									}
+								}
+							
+						}
+
+					} // end even
+					else { // odd columns
+						if (cells[i][j].s >= 1) { 
+							// top left
+							// if (i < ((WIDTH-1) / 2) && j < ((HEIGHT-1)/2)){
+								for (x = 0; x < 2; x++) {
+									for (y = 0; y < 2; y++) {
+
+										int cellx = (2*i)+x;
+										int celly = (2*j)+y+1;
+										VGA_disc(cellx, celly, 0, color);
+
+									}
+								}
+
+						}
+					} // end odd 
+					
+				} // end height for
+			} // end width for
+
+			gettimeofday(&t2, NULL);
+
+			iters++;
+		}
+		
+		elapsed_time = (t2.tv_sec - t1.tv_sec) * 1000000.0;      // sec to us
+		elapsed_time += (t2.tv_usec - t1.tv_usec) ;   // us 
+		elapsed_time = elapsed_time * 0.001;
+		// printf("\ntime per iteration: %.2f ms ", elapsed_time);
+
+		
+	} // end while
+
 }
 
-
-// void * reset_thread() {
-
-//   while (1) {
-  
-//     if (*pio_reset_to_addr) {
-    
-//         // update pio pointers w the initial values 
-//         *(pio_alpha_addr) = float2fix18(temp_alpha);
-//         *(pio_beta_addr)  = float2fix18(temp_beta);
-//         *(pio_gamma_addr) = float2fix18(temp_gamma);
-//         *pio_done_send_addr = 0;
-
-        
-//       // clear VGA screen 
-//       VGA_box (0, 0, 639, 479, 0x0000);
-//       clear_buffer();
-
-//     }
-//   }
-// }
-
 ///////////////////////////////////////////////////////////////
-// scan thread  // 
+// serial mouse read thread  // 
 ///////////////////////////////////////////////////////////////
-// void * scan_thread () { 
 
-//     while (1) { 
-//         printf("1: alpha, 2: beta 3. gamma \n");
-//         scanf("%i", &set);
+void *read_mouse_thread() { 
+	//////// BEGIN  INIT ///////// 
 
-//         switch (set) {
-//             case 1: 
-//                 printf("enter alpha: ");
-//                 scanf("%f", &temp_alpha);
-//                 *pio_alpha_addr = float2fix18(temp_alpha);
-//                 break;
+    int fd, bytes;
+    unsigned char data[3];
 
-//             case 2: 
-//                 printf("enter beta: ");
-//                 scanf("%f", &temp_beta);
-//                 *pio_beta_addr = float2fix18(temp_beta);
-//                 break;
+    const char *pDevice = "/dev/input/mice";
 
-//             case 3: 
-//                 printf("enter gamma: ");
-//                 scanf("%f", &temp_gamma);
-//                 *pio_gamma_addr = float2fix18(temp_gamma);
-//                 break;
-//         }
-//     }
-// }
-
-
-/////////////////////////////////////////////////////////////
-// frozen thread  // 
-/////////////////////////////////////////////////////////////
-// this thread is responsible for going through the incoming 
-// values and addding it to a buffer 
-fix18 y;
-fix18 y_froze;
-
-void * frozen_thread () { 
-
-    while (1) { 
-
-        // read values from the FPGA 
-        y       = *pio_frozen_y_addr;
-        y_froze = *pio_is_frozen_addr;
-
-        // Store values in the buffer
-        if (buffer_index < BUFFER_SIZE) {
-            buffer[buffer_index].is_frozen = y_froze ;
-            buffer[buffer_index].frozen_y = y;
-
-
-            if (buffer[buffer_index].is_frozen == 1) { 
-                VGA_rect(100, 10 * buffer[buffer_index].frozen_y + 100, 
-                                100 + 10, 10 * buffer[buffer_index].frozen_y + 110, blue);
-
-            }
-            else { 
-                VGA_rect(100, 10 * buffer[buffer_index].frozen_y + 100, 
-                        100 + 10, 10 * buffer[buffer_index].frozen_y + 110, white);
-            }
-
-
-            buffer_index++;
-
-            *pio_done_send_addr = 1;
-            *pio_done_send_addr = 0;
- 
-
-        }
-        else { 
-            // this means that the buffer is full 
-            
-            buffer_index = 0;
-            clear_buffer();
-
-        }
-
+    // Open Mouse
+    fd = open(pDevice, O_RDWR);
+    if(fd == -1)
+    {
+        printf("ERROR Opening %s\n", pDevice);
+        return -1;
     }
 
+	int left, middle, right;// button presses
+    signed char x, y, scroll, prev_x, prev_y, x_accum, y_accum; // mouse coordinates
+
+	//////// END MOUSE INIT /////////
+
+	while (1) { 
+
+		// Read Mouse     
+        bytes = read(fd, data, sizeof(data));
+
+		if(bytes > 0)
+        {
+            left = data[0] & 0x1;
+            right = data[0] & 0x2;
+            middle = data[0] & 0x4;
+
+			prev_x = x_accum;
+			prev_y = y_accum;
+			VGA_disc(320+prev_x*3, 240-prev_y*2, 0, 0x0000);
+
+            x = data[1];
+            y = data[2];
+
+			x_accum += x;
+			y_accum += y;
+			int x_coor = 320+x_accum*3;
+			int y_coor = 240-y_accum*2;
+			VGA_disc(x_coor, y_coor, 0, 0x00e0);
+
+			if (left == 1){
+				cells[  x_coor / 2] [ y_coor/2].s = 1.0;
+    			cells[  x_coor / 2] [ y_coor/2].is_receptive = true;
+			}
+		}
+
+		
+		
+	}
 }
-
-
-// Comparison function for qsort
-int compare_y(const void *a, const void *b) {
-    const yCoordinate *coord_a = (const yCoordinate *)a;
-    const yCoordinate *coord_b = (const yCoordinate *)b;
-    return coord_a->frozen_y - coord_b->frozen_y;
-}
-
-///////////////////////////////////////////////////////////////
-// draw thread  // 
-///////////////////////////////////////////////////////////////
-void * draw_thread () { 
-
-    int local_index;
-    yCoordinate coord;
-    int center = 0;
-    int offset;
-
-    while (1) { 
-
-        if (*pio_reset_to_addr) {
-
-            // update pio pointers w the initial values 
-            *(pio_alpha_addr) = float2fix18(temp_alpha);
-            *(pio_beta_addr)  = float2fix18(temp_beta);
-            *(pio_gamma_addr) = float2fix18(temp_gamma);
-
-            // clear VGA screen
-            VGA_box (0, 0, 639, 479, 0x0000);
-            // want the buffer to start from the beginning
-            // i think we need these three lines upon reset but adding them fucks it up?? 
-            // it makes it so that the buffer contet is just empty upon reset!!! 
-            // i think smtg is wrong with reset......
-            // clear_buffer();
-
-            // pthread_mutex_lock(&buffer_mutex);
-            buffer_index = 0;
-            // pthread_mutex_unlock(&buffer_mutex);
-
-        }
-        else {
-            // no reset, we will begin drawing
-            *pio_done_send_addr = 1; // signal to the fpga that we don't want to receive new values, until done drawing this buffer.
-
-
-            // exclusive access to the buffer
-            // pthread_mutex_lock(&buffer_mutex);
-
-            // wait for the buffer to be full and then we want to begin to read 
-            // buffer_not_empty is a conditional variable
-            while (buffer_index <= 0) {
-                pthread_cond_wait(&buffer_not_empty, &buffer_mutex);
-            }
-            // once the buffer has something, unlock mutex and allow other threads 
-            pthread_mutex_unlock(&buffer_mutex);
-
-            // now we are gpmma be readomg through the data 
-
-            // Sort the buffer based on frozen_y coordinates
-            qsort(buffer, buffer_index, sizeof(yCoordinate), compare_y);
-
-            // Draw the center cell in white 
-            // middle element of the sorted buffer, used as sanity check for debugging
-            int center_index = buffer_index / 2;
-            yCoordinate center_coord = buffer[center_index];
-            VGA_rect(100, 10 * center_coord.frozen_y + 100, 
-                    100 + 10, 10 * center_coord.frozen_y + 110, yellow);
-
-            // Draw cells outward from the center
-            for (offset = buffer_index / 2; offset > 0; --offset) {
-                // calculating indices of each cells to draw on either side of the center
-                int index1 = (center_index + offset) % buffer_index;
-                int index2 = (center_index - offset) % buffer_index;
-
-                // obtain coordinates from the bufer
-                yCoordinate coord1 = buffer[index1];
-                yCoordinate coord2 = buffer[index2];
-
-                // since we are drawing 2 indices, check if both are frozen/not frozen
-
-                if (coord1.is_frozen == 1) {
-                    VGA_rect(100, 10 * coord1.frozen_y + 100, 
-                            100 + 10, 10 * coord1.frozen_y + 110, blue);
-                } else {
-                    VGA_rect(100, 10 * coord1.frozen_y + 100, 
-                            100 + 10, 10 * coord1.frozen_y + 110, white);
-                }
-                if (coord2.is_frozen == 1) {
-                    VGA_rect(100, 10 * coord2.frozen_y + 100, 
-                            100 + 10, 10 * coord2.frozen_y + 110, blue);
-                } else {
-                    VGA_rect(100, 10 * coord2.frozen_y + 100, 
-                            100 + 10, 10 * coord2.frozen_y + 110, white);
-                }
-                buffer_index++;      
-            }
-            // used for controlling the drawing speed
-            usleep(500000); 
-
-            
-            // for ( buffer_index = 0; j < BUFFER_SIZE; buffer_index++) {  // Only iterate up to the current buffer index]
-            //     yCoordinate coord1 = buffer[buffer_index];
-            //     if (coord1.is_frozen == 1) {
-            //             VGA_rect(100, 10 * coord1.frozen_y + 100, 
-            //                     100 + 10, 10 * coord1.frozen_y + 110, blue);
-            //         } else {
-            //             VGA_rect(100, 10 * coord1.frozen_y + 100, 
-            //                     100 + 10, 10 * coord1.frozen_y + 110, white);
-            //         }
-            // }
-
-            // usleep(500000); 
-            pthread_cond_signal(&buffer_not_full); 
-            
-        //     if (buffer_index > 0 && buffer_index < 12 ) { 
-        //         // There is something in the buffer, let's check! 
-
-        //         // Sort the buffer based on frozen_y coordinates
-        //         qsort(buffer, buffer_index, sizeof(yCoordinate), compare_y);
-
-        //         // Draw the center cell in white 
-        //         // middle element of the sorted buffer, used as sanity check for debugging
-        //         int center_index = buffer_index / 2;
-        //         yCoordinate center_coord = buffer[center_index];
-        //         VGA_rect(100, 10 * center_coord.frozen_y + 100, 
-        //                 100 + 10, 10 * center_coord.frozen_y + 110, yellow);
-
-        //         // Draw cells outward from the center
-        //         for (offset = buffer_index / 2; offset > 0; --offset) {
-        //             // calculating indices of each cells to draw on either side of the center
-        //             int index1 = (center + offset) % buffer_index;
-        //             int index2 = (center - offset + buffer_index) % buffer_index;
-
-        //             // obtain coordinates from the bufer
-        //             yCoordinate coord1 = buffer[index1];
-        //             yCoordinate coord2 = buffer[index2];
-
-        //             // since we are drawing 2 indices, check if both are frozen/not frozen
-
-        //             if (coord1.is_frozen == 1) {
-        //                 VGA_rect(100, 10 * coord1.frozen_y + 100, 
-        //                         100 + 10, 10 * coord1.frozen_y + 110, blue);
-        //             } else {
-        //                 VGA_rect(100, 10 * coord1.frozen_y + 100, 
-        //                         100 + 10, 10 * coord1.frozen_y + 110, white);
-        //             }
-        //             if (coord2.is_frozen == 1) {
-        //                 VGA_rect(100, 10 * coord2.frozen_y + 100, 
-        //                         100 + 10, 10 * coord2.frozen_y + 110, blue);
-        //             } else {
-        //                 VGA_rect(100, 10 * coord2.frozen_y + 100, 
-        //                         100 + 10, 10 * coord2.frozen_y + 110, white);
-        //             }
-        //             buffer_index++;      
-        //         }
-        //         // used for controlling the drawing speed
-        //         usleep(500000); 
-
-        //     // Reset buffer after drawing the snowflake
-        //     buffer_index = 0; 
-        //     pthread_cond_signal(&buffer_not_full); 
-
-        
-        }
-        pthread_mutex_unlock(&buffer_mutex);
-        *pio_done_send_addr = 1;
-
-        *pio_done_send_addr = 0;
-
-    }
-    // while (1) { 
-
-    //     // read values from the FPGA 
-    //     y       = *pio_frozen_y_addr;
-    //     y_froze = *pio_is_frozen_addr;
-
-    //     *pio_done_send_addr = 1;
-
-    //     if (y_froze == 1) { 
-    //             VGA_rect(100, 10 * y + 100, 
-    //                             100 + 10, 10 * y + 110, blue);
-
-    //     }
-    //     else { 
-    //             VGA_rect(100, 10 * y + 100, 
-    //                     100 + 10, 10 * y + 110, white);
-    //     }
-
-    //         *pio_done_send_addr = 1;
-
-    //         *pio_done_send_addr = 0;
-
-    // }
-
-}
-
-
-int p;
 
 
 int main(void)
 {
+	// Declare volatile pointers to I/O registers (volatile 	// means that IO load and store instructions will be used 	// to access these pointer locations, 
+	// instead of regular memory loads and stores) 
 
-    // Declare volatile pointers to I/O registers (volatile     // means that IO load and store instructions will be used   // to access these pointer locations, 
-    // instead of regular memory loads and stores) 
+	// === shared memory =======================
+	// with video process
+	// shared_mem_id = shmget(mem_key, 100, IPC_CREAT | 0666);
+ 	// //shared_mem_id = shmget(mem_key, 100, 0666);
+	// shared_ptr = shmat(shared_mem_id, NULL, 0);
 
-    // === shared memory =======================
-    // with video process
-    shared_mem_id = shmget(mem_key, 100, IPC_CREAT | 0666);
-    //shared_mem_id = shmget(mem_key, 100, 0666);
-    shared_ptr = shmat(shared_mem_id, NULL, 0);
-
-    // === need to mmap: =======================
-    // FPGA_CHAR_BASE
-    // FPGA_ONCHIP_BASE      
-    // HW_REGS_BASE        
+	// === need to mmap: =======================
+	// FPGA_CHAR_BASE
+	// FPGA_ONCHIP_BASE      
+	// HW_REGS_BASE        
   
-    // === get FPGA addresses ==================
+	// === get FPGA addresses ==================
     // Open /dev/mem
-    if( ( fd = open( "/dev/mem", ( O_RDWR | O_SYNC ) ) ) == -1 )    {
-        printf( "ERROR: could not open \"/dev/mem\"...\n" );
-        return( 1 );
-    }
+	if( ( fd = open( "/dev/mem", ( O_RDWR | O_SYNC ) ) ) == -1 ) 	{
+		printf( "ERROR: could not open \"/dev/mem\"...\n" );
+		return( 1 );
+	}
     
     // get virtual addr that maps to physical
-    h2p_lw_virtual_base = mmap( NULL, HW_REGS_SPAN, ( PROT_READ | PROT_WRITE ), MAP_SHARED, fd, HW_REGS_BASE ); 
-    if( h2p_lw_virtual_base == MAP_FAILED ) {
-        printf( "ERROR: mmap1() failed...\n" );
-        close( fd );
-        return(1);
-    }
+	h2p_lw_virtual_base = mmap( NULL, HW_REGS_SPAN, ( PROT_READ | PROT_WRITE ), MAP_SHARED, fd, HW_REGS_BASE );	
+	if( h2p_lw_virtual_base == MAP_FAILED ) {
+		printf( "ERROR: mmap1() failed...\n" );
+		close( fd );
+		return(1);
+	}
     
 
-    // === get VGA char addr =====================
-    // get virtual addr that maps to physical
-    vga_char_virtual_base = mmap( NULL, FPGA_CHAR_SPAN, (   PROT_READ | PROT_WRITE ), MAP_SHARED, fd, FPGA_CHAR_BASE ); 
-    if( vga_char_virtual_base == MAP_FAILED ) {
-        printf( "ERROR: mmap2() failed...\n" );
-        close( fd );
-        return(1);
-    }
+	// === get VGA char addr =====================
+	// get virtual addr that maps to physical
+	vga_char_virtual_base = mmap( NULL, FPGA_CHAR_SPAN, ( 	PROT_READ | PROT_WRITE ), MAP_SHARED, fd, FPGA_CHAR_BASE );	
+	if( vga_char_virtual_base == MAP_FAILED ) {
+		printf( "ERROR: mmap2() failed...\n" );
+		close( fd );
+		return(1);
+	}
     
     // Get the address that maps to the FPGA LED control 
-    vga_char_ptr =(unsigned int *)(vga_char_virtual_base);
+	vga_char_ptr =(unsigned int *)(vga_char_virtual_base);
 
-    // === get VGA pixel addr ====================
-    // get virtual addr that maps to physical
-    vga_pixel_virtual_base = mmap( NULL, FPGA_ONCHIP_SPAN, (    PROT_READ | PROT_WRITE ), MAP_SHARED, fd,           FPGA_ONCHIP_BASE);  
-    if( vga_pixel_virtual_base == MAP_FAILED ) {
-        printf( "ERROR: mmap3() failed...\n" );
-        close( fd );
-        return(1);
-    }
+	// === get VGA pixel addr ====================
+	// get virtual addr that maps to physical
+	vga_pixel_virtual_base = mmap( NULL, FPGA_ONCHIP_SPAN, ( 	PROT_READ | PROT_WRITE ), MAP_SHARED, fd, 			FPGA_ONCHIP_BASE);	
+	if( vga_pixel_virtual_base == MAP_FAILED ) {
+		printf( "ERROR: mmap3() failed...\n" );
+		close( fd );
+		return(1);
+	}
     
     // Get the address that maps to the FPGA pixel buffer
-    vga_pixel_ptr =(unsigned int *)(vga_pixel_virtual_base);
+	vga_pixel_ptr =(unsigned int *)(vga_pixel_virtual_base);
 
-    // ===========================================
+	// RAM FPGA PARAMETER ADDING 
+	sram_virtual_base = mmap(NULL, FPGA_ONCHIP_SPAN, (PROT_READ | PROT_WRITE ), MAP_SHARED, fd, FPGA_ONCHIP_BASE);
 
-    // PIO POINTER STUFF
-    // Maps to FPGA registers
-    pio_alpha_addr   = (unsigned int *)(h2p_lw_virtual_base +  PIO_ALPHA_BASE );
-    pio_beta_addr    = (unsigned int *)(h2p_lw_virtual_base +  PIO_BETA_BASE );
-    pio_gamma_addr   = (unsigned int *)(h2p_lw_virtual_base +  PIO_GAMMA_BASE );
-    pio_is_frozen_addr = (unsigned int *)(h2p_lw_virtual_base +  PIO_IS_FROZEN_BASE );
-    pio_frozen_y_addr = (unsigned int *)(h2p_lw_virtual_base +  PIO_FROZEN_Y_BASE );
-    pio_reset_to_addr = (unsigned int *)(h2p_lw_virtual_base +  PIO_RESET_TO_BASE );
-    pio_done_send_addr = (unsigned int *)(h2p_lw_virtual_base +  PIO_DONE_SEND_BASE );
+	if (sram_virtual_base == MAP_FAILED) { 
+		printf( "ERROR: mmap3() failed...\n" );
+		close( fd );
+		return(1);
 
-    /// VISUALIZE ON THE SCREEN /// 
+	}
+	
+	sram_ptr = (unsigned int *) (sram_virtual_base);
+	pio_reset_to_hps = (unsigned int *)(h2p_lw_virtual_base + PIO_RESET_TO_HPS_BASE);
 
-    char text_x[40] = "init alpha = ";
-    char text_y[40] = "init beta = ";
-    char text_z[40] = "init gamma = ";
-    /* create a message to be displayed on the VGA 
-          and LCD displays */
-    char text_top_row[40]    = "DE1-SoC ARM/FPGA\0";
-    char text_bottom_row[40] = "Cornell ece5760\0";
+	// ===========================================
+	VGA_box (0, 0, 639, 479, 0x0000);
 
-    // VGA_box (0, 0, 639, 479, 0x0000);
+	// thread identifiers
+   	pthread_t thread_scan, thread_draw, thread_reset, thread_mouse;
 
-    VGA_text (34, 1, text_top_row);
-    VGA_text (34, 2, text_bottom_row);
-    VGA_text (34, 3, text_x);
-    VGA_text (34, 4, text_y);
-    VGA_text (34, 5, text_z);
+	pthread_attr_t attr;
+	pthread_attr_init( &attr );
+	pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_JOINABLE );
+	
+	 // now the threads
+	pthread_create( &thread_reset, NULL, reset_thread, NULL );
+	pthread_create( &thread_draw, NULL, draw_thread, NULL );
+	pthread_create( &thread_scan, NULL, scan_thread, NULL );
+	pthread_create( &thread_mouse, NULL, read_mouse_thread, NULL );
 
-    // Initial values to send to fpga 
-    *pio_alpha_addr = float2fix18(temp_alpha);
-    *pio_beta_addr  = float2fix18(temp_beta);
-    *pio_gamma_addr = float2fix18(temp_gamma);
+	pthread_join( thread_reset, NULL );
+	pthread_join( thread_draw, NULL );
+	pthread_join( thread_scan, NULL );
+	pthread_join( thread_mouse, NULL );
 
-    while (1) { 
+   	return 0;
 
-        // read values from the FPGA 
-        y       = *pio_frozen_y_addr;
-        y_froze = *pio_is_frozen_addr;
 
-        *pio_done_send_addr = 1;
+	
 
-        if (y_froze == 1) { 
-                VGA_rect(100, 10 * y + 100, 
-                                100 + 10, 10 * y + 110, blue);
-
-        }
-        else { 
-                VGA_rect(100, 10 * y + 100, 
-                        100 + 10, 10 * y + 110, white);
-        }
-
-            *pio_done_send_addr = 1;
-
-            *pio_done_send_addr = 0;
-
-    }
-
-    // pthread_mutex_init(&buffer_mutex, NULL);
-
-    // thread identifiers
-    // pthread_t thread_frozen, thread_draw, thread_debug;
-
-    // pthread_attr_t attr;
-    // pthread_attr_init( &attr );
-    // pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_JOINABLE );
-    
-     // now the threads
-    // pthread_create( &thread_reset, NULL,    reset_thread, NULL );
-    // pthread_create( &thread_scan, NULL,     scan_thread,  NULL );
-    // pthread_create( &thread_debug, NULL,     debug_thread, NULL );
-    // pthread_create( &thread_frozen, NULL,   frozen_thread, NULL );
-    // pthread_create( &thread_draw, NULL,     draw_thread, NULL );
-
-    // pthread_join( thread_reset, NULL );
-    // pthread_join( thread_scan, NULL );
-    // pthread_join( thread_debug,  NULL );
-    // pthread_join( thread_frozen, NULL );
-    // pthread_join( thread_draw,   NULL );
-
-    // pthread_mutex_destroy(&buffer_mutex);
-
-	// printf(buffer_index);
-    // for ( i = 0; i < buffer_index; ++i) {  // Only iterate up to the current buffer index
-    //     printf("idx %d: is_frozen = %d, frozen_y = %d\n", i, buffer[i].is_frozen, buffer[i].frozen_y);
-    // }
-
-    return 0;
-
-    // initialize_grid();
-
-    // VGA_text (10, 1, text_top_row);
-    // VGA_text (10, 2, text_bottom_row);
-    
-} // end main
+} // end main 
 
 
 void VGA_cell(int x1, int y1, int x2, int y2, short pixel_color)
 {
-    VGA_PIXEL(x1,y1,pixel_color);
-    VGA_PIXEL(x1,y2,pixel_color);
-    VGA_PIXEL(x2,y1,pixel_color);
-    VGA_PIXEL(x2,y2,pixel_color);
+	VGA_PIXEL(x1,y1,pixel_color);
+	VGA_PIXEL(x1,y2,pixel_color);
+	VGA_PIXEL(x2,y1,pixel_color);
+	VGA_PIXEL(x2,y2,pixel_color);
 
 }
 
+
 /****************************************************************************************
- * Subroutine to send a string of text to the VGA monitor 
+ * Subroutine to send a string of text to the VGA monitor
 ****************************************************************************************/
 void VGA_text(int x, int y, char * text_ptr)
 {
-    volatile char * character_buffer = (char *) vga_char_ptr ;  // VGA character buffer
-    int offset;
-    /* assume that the text string fits on one line */
-    offset = (y << 7) + x;
-    while ( *(text_ptr) )
-    {
-        // write to the character buffer
-        *(character_buffer + offset) = *(text_ptr); 
-        ++text_ptr;
-        ++offset;
-    }
+  	volatile char * character_buffer = (char *) vga_char_ptr ;	// VGA character buffer
+	int offset;
+	/* assume that the text string fits on one line */
+	offset = (y << 7) + x;
+	while ( *(text_ptr) )
+	{
+		// write to the character buffer
+		*(character_buffer + offset) = *(text_ptr);
+		++text_ptr;
+		++offset;
+	}
 }
 
 /****************************************************************************************
- * Subroutine to clear text to the VGA monitor 
+ * Subroutine to clear text to the VGA monitor
 ****************************************************************************************/
 void VGA_text_clear()
 {
-    volatile char * character_buffer = (char *) vga_char_ptr ;  // VGA character buffer
-    int offset, x, y;
-    for (x=0; x<79; x++){
-        for (y=0; y<59; y++){
-    /* assume that the text string fits on one line */
-            offset = (y << 7) + x;
-            // write to the character buffer
-            *(character_buffer + offset) = ' ';     
-        }
-    }
+  	volatile char * character_buffer = (char *) vga_char_ptr ;	// VGA character buffer
+	int offset, x, y;
+	for (x=0; x<79; x++){
+		for (y=0; y<59; y++){
+	/* assume that the text string fits on one line */
+			offset = (y << 7) + x;
+			// write to the character buffer
+			*(character_buffer + offset) = ' ';
+		}
+	}
 }
 
 /****************************************************************************************
- * Draw a filled rectangle on the VGA monitor 
+ * Draw a filled rectangle on the VGA monitor
 ****************************************************************************************/
-#define SWAP(X,Y) do{int temp=X; X=Y; Y=temp;}while(0) 
+#define SWAP(X,Y) do{int temp=X; X=Y; Y=temp;}while(0)
 
 void VGA_box(int x1, int y1, int x2, int y2, short pixel_color)
 {
-    char  *pixel_ptr ; 
+    char  *pixel_ptr ;
     int row, col;
 
     /* check and fix box coordinates to be valid */
@@ -724,50 +737,141 @@ void VGA_box(int x1, int y1, int x2, int y2, short pixel_color)
         for (col = x1; col <= x2; ++col)
         {
             //640x480
-            pixel_ptr = (char *)vga_pixel_ptr + (row<<10)    + col ;
-            // set pixel color
-            *(char *)pixel_ptr = pixel_color;       
+            VGA_disc(col, row, 0, pixel_color);
         }
 }
 
 /****************************************************************************************
- * Draw an UNFILLED rectangle on the VGA monitor 
+ * Draw a filled circle on the VGA monitor using GPU FSM
 ****************************************************************************************/
-void VGA_rect(int x1, int y1, int x2, int y2, short pixel_color)
-{
-    char  *pixel_ptr ; 
-    int row, col;
 
-    /* check and fix box coordinates to be valid */
-    if (x1>639) x1 = 639;
-    if (y1>479) y1 = 479;
-    if (x2>639) x2 = 639;
-    if (y2>479) y2 = 479;
-    if (x1<0) x1 = 0;
-    if (y1<0) y1 = 0;
-    if (x2<0) x2 = 0;
-    if (y2<0) y2 = 0;
-    if (x1>x2) SWAP(x1,x2);
-    if (y1>y2) SWAP(y1,y2);
-    for (row = y1; row <= y2; row++){
-        if (row == y1 || row == y2){
-            for (col = x1; col <= x2; ++col)
-            {
-                //640x480
-                pixel_ptr = (char *)vga_pixel_ptr + (row<<10)    + col ;
-                // set pixel color
-                *(char *)pixel_ptr = pixel_color;       
+void VGA_disc(int x, int y, int r, short pixel_color)
+{
+	char  *pixel_ptr ;
+	int row, col, rsqr, xc, yc;
+
+	rsqr = r*r;
+
+	for (yc = -r; yc <= r; yc++)
+		for (xc = -r; xc <= r; xc++)
+		{
+			col = xc;
+			row = yc;
+			// add the r to make the edge smoother
+			if(col*col+row*row <= rsqr+r){
+				col += x; // add the center point
+				row += y; // add the center point
+				//check for valid 640x480
+				if (col>639) col = 639;
+				if (row>479) row = 479;
+				if (col<0) col = 0;
+				if (row<0) row = 0;
+
+                // set up scratch pad parameters
+                *(sram_ptr+1) = col-0.5;
+                *(sram_ptr+2) = row-0.5;
+                *(sram_ptr+3) = col;
+                *(sram_ptr+4) = row;
+                *(sram_ptr+5) = pixel_color;
+                *(sram_ptr) = 1; // the "data-ready" flag
+
+                // wait for FPGA to zero the "data_ready" flag
+                while (*(sram_ptr)>0) ;
+
             }
-        }
-        else{
-            //640x480
-            pixel_ptr = (char *)vga_pixel_ptr + (row<<10)    + x1 ;
-            // set pixel color
-            *(char *)pixel_ptr = pixel_color;   
-            //640x480
-            pixel_ptr = (char *)vga_pixel_ptr + (row<<10)    + x2 ;
-            // set pixel color
-            *(char *)pixel_ptr = pixel_color;   
-        }
-    }
+
+		}
 }
+
+// =============================================
+// === Draw a line
+// =============================================
+//plot a line
+//at x1,y1 to x2,y2 with color
+//Code is from David Rodgers,
+//"Procedural Elements of Computer Graphics",1985
+void VGA_line(int x1, int y1, int x2, int y2, short c) {
+	int e;
+	signed int dx,dy,j, temp;
+	signed int s1,s2, xchange;
+     signed int x,y;
+	char *pixel_ptr ;
+
+	/* check and fix line coordinates to be valid */
+	if (x1>639) x1 = 639;
+	if (y1>479) y1 = 479;
+	if (x2>639) x2 = 639;
+	if (y2>479) y2 = 479;
+	if (x1<0) x1 = 0;
+	if (y1<0) y1 = 0;
+	if (x2<0) x2 = 0;
+	if (y2<0) y2 = 0;
+
+	x = x1;
+	y = y1;
+
+	//take absolute value
+	if (x2 < x1) {
+		dx = x1 - x2;
+		s1 = -1;
+	}
+
+	else if (x2 == x1) {
+		dx = 0;
+		s1 = 0;
+	}
+
+	else {
+		dx = x2 - x1;
+		s1 = 1;
+	}
+
+	if (y2 < y1) {
+		dy = y1 - y2;
+		s2 = -1;
+	}
+
+	else if (y2 == y1) {
+		dy = 0;
+		s2 = 0;
+	}
+
+	else {
+		dy = y2 - y1;
+		s2 = 1;
+	}
+
+	xchange = 0;
+
+	if (dy>dx) {
+		temp = dx;
+		dx = dy;
+		dy = temp;
+		xchange = 1;
+	}
+
+	e = ((int)dy<<1) - dx;
+
+	for (j=0; j<=dx; j++) {
+		//video_pt(x,y,c); //640x480
+		VGA_PIXEL(x, y, c);
+		//pixel_ptr = (char *)vga_pixel_ptr + (y<<10)+ x;
+		// set pixel color
+		//*(char *)pixel_ptr = c;
+
+		if (e>=0) {
+			if (xchange==1) x = x + s1;
+			else y = y + s2;
+			e = e - ((int)dx<<1);
+		}
+
+		if (xchange==1) y = y + s2;
+		else x = x + s1;
+
+		e = e + ((int)dy<<1);
+	}
+}
+
+/// /// /////////////////////////////////////
+/// end /////////////////////////////////////
+              
